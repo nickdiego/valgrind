@@ -6,6 +6,7 @@ include $(top_srcdir)/Makefile.all.am
 TOOLS =		memcheck \
 		cachegrind \
 		callgrind \
+		freya \
 		massif \
 		lackey \
 		none \
