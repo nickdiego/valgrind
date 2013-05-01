@@ -155,9 +155,9 @@ static void fr_print_bytes(Char* name, Long value)
     VG_(printf)("(%lldb) ", value);
 }
 
-static void fr_sort_and_dump(Trace_Block* block, Int indent)
+// Sort by total (min sort)
+static void fr_sort_block(Trace_Block** block)
 {
-   Int i;
    Trace_Block* from;
    Trace_Block* from_prev;
    Trace_Block* max;
@@ -165,25 +165,8 @@ static void fr_sort_and_dump(Trace_Block* block, Int indent)
    Trace_Block* it;
    Trace_Block* it_prev;
 
-   tl_assert((!block->parent && trace_head == block) || (block->parent && block->parent->first == block));
-
-   if (block->parent && block->next == NULL) {
-      // One child, no need to sort
-      if (block->peak < clo_min)
-         return;
-
-      for (i = 0; i < indent; ++i)
-         VG_(printf)("  ");
-      fr_print_block(block);
-
-      if (block->first)
-         fr_sort_and_dump(block->first, indent + 1);
-      return;
-   }
-
-   // Sort by total (min sort)
    from_prev = NULL;
-   from = block;
+   from = *block;
    while (from) {
       max_prev = NULL;
       max = from;
@@ -218,12 +201,35 @@ static void fr_sort_and_dump(Trace_Block* block, Int indent)
                 from->parent->first = max;
             else
                 trace_head = max;
-            block = max;
+            *block = max;
          }
       }
       from_prev = max;
       from = max->next;
    }
+}
+
+static void fr_sort_and_dump_raw(Trace_Block* block, Int indent)
+{
+   Int i;
+
+   tl_assert((!block->parent && trace_head == block) || (block->parent && block->parent->first == block));
+
+   if (block->parent && block->next == NULL) {
+      // One child, no need to sort
+      if (block->peak < clo_min)
+         return;
+
+      for (i = 0; i < indent; ++i)
+         VG_(printf)("  ");
+      fr_print_block(block);
+
+      if (block->first)
+         fr_sort_and_dump_raw(block->first, indent + 1);
+      return;
+   }
+
+   fr_sort_block(&block);
 
    while (block) {
       if (block->peak < clo_min)
@@ -245,10 +251,121 @@ static void fr_sort_and_dump(Trace_Block* block, Int indent)
       fr_print_block(block);
 
       if (block->first)
-         fr_sort_and_dump(block->first, indent + 1);
+         fr_sort_and_dump_raw(block->first, indent + 1);
 
       block = block->next;
    }
+}
+
+static Bool fr_print_block_json(Trace_Block* block)
+{
+   UInt linenum;
+   Bool dirname_available = False;
+
+   if (block->ips) {
+      if (VG_(get_fnname)( block->ips, fnname_buffer, NAME_BUFFER_SIZE ))
+         VG_(printf)("%s ", fnname_buffer);
+
+      if (VG_(get_filename_linenum)( block->ips, dir_buffer + DIR_BUFFER_SIZE, NAME_BUFFER_SIZE, dir_buffer, DIR_BUFFER_SIZE, &dirname_available, &linenum)) {
+         if (!dirname_available)
+            VG_(printf)("(%s:%d)\n", dir_buffer + DIR_BUFFER_SIZE, linenum);
+         else
+            VG_(printf)("(%s/%s:%d)\n", dir_buffer, dir_buffer + DIR_BUFFER_SIZE, linenum);
+         return False;
+      }
+
+      if (VG_(get_objname)( block->ips, dir_buffer, DIR_BUFFER_SIZE ))
+         VG_(printf)("(%s)\n", dir_buffer);
+      else
+         VG_(printf)("(Unknown file)\n");
+      return False;
+
+   } else {
+      VG_(printf)("Group: %s\n", block->name);
+      return True;
+   }
+}
+
+// TODO: Temp - only used for debug
+static inline void fr_indent(int level) {
+  register int i;
+  for (i = 0; i < level; ++i)
+     VG_(printf)("  ");
+}
+
+static int fr_sort_and_dump_json(Trace_Block* block, Int indent)
+{
+   Bool is_group;
+   Int group_count;
+
+   tl_assert((!block->parent && trace_head == block) || (block->parent && block->parent->first == block));
+
+   if (block->parent && block->next == NULL) {
+      // One child, no need to sort
+      if (block->peak < clo_min)
+         return 0;
+
+      fr_indent(indent);
+      VG_(printf)("{\n");
+
+      fr_indent(indent);
+      is_group = fr_print_block_json(block);
+
+      if (block->first)
+         fr_sort_and_dump_json(block->first, indent + 1);
+
+      fr_indent(indent);
+      VG_(printf)("}\n");
+
+      return 0;
+   }
+
+   fr_sort_block(&block);
+
+   while (block) {
+      if (block->peak < clo_min)
+         break;
+
+      fr_indent(indent);
+      VG_(printf)("{\n");
+      
+      fr_indent(indent);
+      fr_print_bytes("Peak: ", block->peak);
+      VG_(printf)("\n");
+      
+      fr_indent(indent);
+      VG_(printf)("Allocs: %d ", block->allocs);
+      VG_(printf)("\n");
+      
+      fr_indent(indent);
+      fr_print_bytes("Total: ", block->total);
+      VG_(printf)("\n");
+      
+      if (block->current > 0) {
+         fr_indent(indent);
+         fr_print_bytes("Leak: ", block->current);
+         VG_(printf)("\n");
+      }
+      
+      fr_indent(indent);
+      is_group = fr_print_block_json(block);
+
+      if (block->first)
+         fr_sort_and_dump_json(block->first, indent + 1);
+
+      block = block->next;
+      
+      if (is_group) {
+        fr_indent(indent);
+
+        if (block)
+           VG_(printf)("},\n");
+        else 
+           VG_(printf)("}\n");
+      }
+      group_count += (is_group)? 1: 0;
+   }
+   return group_count;
 }
 
 // ---------------------------------------------------------------
@@ -1047,7 +1164,8 @@ IRSB* fr_instrument(VgCallbackClosure* closure,
 
 static void fr_fini(Int exitcode)
 {
-   fr_sort_and_dump(trace_head, 0);
+   fr_sort_and_dump_json(trace_head, 0);
+   //fr_sort_and_dump_raw(trace_head, 0);
 }
 
 static Char* parse_rule(Char* read_ptr, Rule_List** last_rule_ptr)
